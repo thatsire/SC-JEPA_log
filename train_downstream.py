@@ -1,199 +1,143 @@
+"""
+Downstream failure prediction: encoder (pre-trained SC-JEPA or from scratch) + classifier.
+
+Changes with respect to the original version:
+  * input pipeline identical to pre-training (same Dataset, same scaler, no instance norm);
+  * 24h of input (4 patches) instead of the last 12h of a 24h window;
+  * class-weighted cross-entropy (positives are ~1% of the windows);
+  * LR scheduler and model selection driven by validation F1 (the original stepped a
+    mode='max' scheduler with the validation LOSS, halving the LR every 3 epochs, and
+    selected the checkpoint by CE loss, which favours a majority-class predictor);
+  * optional warm-up with a frozen encoder before full fine-tuning;
+  * --from_scratch ablation to measure what pre-training actually contributes.
+"""
+import argparse
 import os
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import wandb
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from torch.utils.data import DataLoader, WeightedRandomSampler, Dataset
 
-from data.utils import set_seed
 from data.datasets import PredictiveMaintenanceDataset
+from data.utils import set_seed
+from models.classifier import SimpleClassifier
 from models.encoder import Encoder
-from models.classifier import SimpleClassifier, FocalLoss
 from utils.evaluation import evaluate
 
+ap = argparse.ArgumentParser()
+ap.add_argument("--data_dir", default="dataset")
+ap.add_argument("--ckpt_dir", default="checkpoints")
+ap.add_argument("--encoder_ckpt", default=None, help="defaults to <ckpt_dir>/encoder.pth")
+ap.add_argument("--encoder_key", default="ema", choices=["ema", "online"])
+ap.add_argument("--from_scratch", action="store_true", help="ablation: random init, no pre-training")
+ap.add_argument("--freeze_epochs", type=int, default=3, help="epochs with frozen encoder before fine-tuning")
+ap.add_argument("--epochs", type=int, default=25)
+ap.add_argument("--patience", type=int, default=8)
+ap.add_argument("--batch_size", type=int, default=256)
+ap.add_argument("--lr_encoder", type=float, default=1e-4)
+ap.add_argument("--lr_classifier", type=float, default=1e-3)
+ap.add_argument("--out_name", default="downstream", help="checkpoint name inside ckpt_dir")
+ap.add_argument("--wandb", action="store_true")
+args = ap.parse_args()
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Using device: {DEVICE}")
 set_seed(42)
 
-WINDOW_SIZE = 24  
+WINDOW_SIZE = 24           # hours of input
+FORECAST_HORIZON = 12      # failure within the next 12h
 PATCH_LEN = 6
-NUM_PATCHES = (WINDOW_SIZE // 2) // PATCH_LEN   
-LATENT_DIM = 64     
-CNN_H_DIM = 64          
-NHEAD = 2           
-NUM_TRANS_LAYERS = 2
+NUM_PATCHES = WINDOW_SIZE // PATCH_LEN   # 4, same as pre-training (24h past)
+LATENT_DIM, CNN_H_DIM, NHEAD, NUM_TRANS_LAYERS = 64, 64, 2, 2
 
-BATCH_SIZE = 256
-EPOCHS = 50
+print("[INFO] Preparing data...")
+train_ds = PredictiveMaintenanceDataset(os.path.join(args.data_dir, "train.csv"), mode="downstream",
+                                        window_size=WINDOW_SIZE, forecast_horizon=FORECAST_HORIZON, patch_len=PATCH_LEN)
+val_ds = PredictiveMaintenanceDataset(os.path.join(args.data_dir, "val.csv"), mode="downstream", window_size=WINDOW_SIZE,
+                                      forecast_horizon=FORECAST_HORIZON, patch_len=PATCH_LEN, scaler=train_ds.scaler)
+IN_CHANNELS = train_ds.in_channels
+train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
+val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
 
-DATA_DIR = "/home/jovyan/workspace/SC-JEPA/data" 
-CHECKPOINT_DIR = '/home/jovyan/workspace/SC-JEPA/checkpoints'
+labels = train_ds.window_labels()
+n_pos, n_neg = int(labels.sum()), int((labels == 0).sum())
+class_weight = torch.tensor([1.0, n_neg / n_pos], dtype=torch.float32, device=DEVICE)
+print(f"[INFO] Train windows {len(train_ds)} (pos {n_pos} = {100*n_pos/len(labels):.2f}%)  Val windows {len(val_ds)}  "
+      f"class weights {class_weight.tolist()}")
 
-class DownstreamWrapper(Dataset):
-    def __init__(self, original_ds, num_patches, patch_len, in_channels):
-        self.ds = original_ds
-        self.num_patches = num_patches
-        self.patch_len = patch_len
-        self.in_channels = in_channels
-        
-        print(f"[INFO] Extracting labels for {len(self.ds)} sequences...")
-        y_matrix = self.ds.df[self.ds.label_cols].values
-        labels = []
-        
-        for seq in self.ds.sequences:
-            y_window = y_matrix[seq['label_start'] : seq['label_end']]
-            y_label = np.zeros(1) if y_window.size == 0 else np.max(y_window, axis=0)
-            y_tensor = torch.tensor(y_label, dtype=torch.float32)
-            y_expanded = y_tensor.repeat(self.num_patches).to(torch.long)
-            labels.append(y_expanded)
-            
-        self.y_label = torch.stack(labels)
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        x, _ = self.ds[idx]
-        y_expanded = self.y_label[idx]
-        past_hours = self.num_patches * self.patch_len
-        x_recent = x[-past_hours:, :]
-        x_reshaped = x_recent.view(self.num_patches, self.patch_len, self.in_channels)
-        return x_reshaped, y_expanded
-
-print("[INFO] Preparing data for downstream classification...")
-train_csv = os.path.join(DATA_DIR, "train.csv")
-val_csv = os.path.join(DATA_DIR, "val.csv")
-test_csv = os.path.join(DATA_DIR, "test.csv")
-
-train_ds_downstream = PredictiveMaintenanceDataset(train_csv, window_size=WINDOW_SIZE, mode='downstream')
-x_sample, _ = train_ds_downstream[0]
-IN_CHANNELS = x_sample.shape[1]
-val_ds_downstream = PredictiveMaintenanceDataset(val_csv, window_size=WINDOW_SIZE, mode='downstream', scaler=train_ds_downstream.scaler)
-test_ds_downstream = PredictiveMaintenanceDataset(test_csv, window_size=WINDOW_SIZE, mode='downstream', scaler=train_ds_downstream.scaler)
-
-print("[INFO] Applying Downstream Wrapper...")
-train_ds_wrapped = DownstreamWrapper(train_ds_downstream, NUM_PATCHES, PATCH_LEN, IN_CHANNELS)
-val_ds_wrapped = DownstreamWrapper(val_ds_downstream, NUM_PATCHES, PATCH_LEN, IN_CHANNELS)
-test_ds_wrapped = DownstreamWrapper(test_ds_downstream, NUM_PATCHES, PATCH_LEN, IN_CHANNELS)
-
-print(f"Downstream data ready! Train: {len(train_ds_wrapped)}, Val: {len(val_ds_wrapped)}, Test: {len(test_ds_wrapped)}")
-
-train_loader_down = DataLoader(train_ds_wrapped, batch_size=BATCH_SIZE, shuffle = True, num_workers=4, pin_memory=True)
-val_loader_down = DataLoader(val_ds_wrapped, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-test_loader_down = DataLoader(test_ds_wrapped, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-
-print("[INFO] Initializing models and loading pre-trained encoder weights...")
-encoder = Encoder(
-    num_patches=NUM_PATCHES, patch_len=PATCH_LEN, latent_dim=LATENT_DIM, 
-    cnn_h_dim=CNN_H_DIM, trans_nhead=NHEAD, trans_num_layers=NUM_TRANS_LAYERS, in_channels=IN_CHANNELS
-).to(DEVICE)
-
-best_encoder_path = os.path.join(CHECKPOINT_DIR, 'encoder.pth')
-encoder.load_state_dict(torch.load(best_encoder_path, map_location=DEVICE, weights_only=True))
+encoder = Encoder(num_patches=NUM_PATCHES, patch_len=PATCH_LEN, latent_dim=LATENT_DIM, cnn_h_dim=CNN_H_DIM,
+                  trans_nhead=NHEAD, trans_num_layers=NUM_TRANS_LAYERS, in_channels=IN_CHANNELS).to(DEVICE)
+if args.from_scratch:
+    print("[INFO] Encoder randomly initialised (ablation, no pre-training)")
+    args.freeze_epochs = 0
+else:
+    path = args.encoder_ckpt or os.path.join(args.ckpt_dir, "encoder.pth")
+    ckpt = torch.load(path, map_location=DEVICE, weights_only=True)
+    cfg = ckpt["config"]
+    assert cfg["in_channels"] == IN_CHANNELS and cfg["num_patches"] == NUM_PATCHES, f"encoder config mismatch: {cfg}"
+    encoder.load_state_dict(ckpt[args.encoder_key])
+    print(f"[INFO] Loaded pre-trained encoder ({args.encoder_key}) from {path}")
 
 classifier = SimpleClassifier(input_dim=LATENT_DIM, num_patches=NUM_PATCHES).to(DEVICE)
-criterion = nn.CrossEntropyLoss()
+criterion = nn.CrossEntropyLoss(weight=class_weight)
+optimizer = optim.AdamW([{"params": encoder.parameters(), "lr": args.lr_encoder},
+                         {"params": classifier.parameters(), "lr": args.lr_classifier}], weight_decay=1e-4)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
 
-optimizer = optim.AdamW([
-    {'params': encoder.parameters(), 'lr': 5e-5},
-    {'params': classifier.parameters(), 'lr': 1e-3}
-], weight_decay=1e-4)
+if args.wandb:
+    import wandb
+    wandb.init(project="SC-JEPA", name=f"scjepa-{args.out_name}", config=vars(args))
 
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
-
-wandb.init(
-    project="SC-JEPA",
-    entity="irene-barbagallo03-universit-degli-studi-di-catania",
-    name="scjepa-downstream",
-    config={
-        "epochs": EPOCHS,
-        "learning_rate_encoder": 5e-5,
-        "learning_rate_classifier": 1e-3,
-        "batch_size": BATCH_SIZE,
-        "window_size": WINDOW_SIZE
-    }
-)
-best_val_loss = float('inf')
-best_thresh = 0.5
-wait = 0
-patience = 10
-downstream_model_path = os.path.join(CHECKPOINT_DIR, "downstream.pth")
+os.makedirs(args.ckpt_dir, exist_ok=True)
+ckpt_path = os.path.join(args.ckpt_dir, f"{args.out_name}.pth")
+best_f1, wait = -1.0, 0
 
 print("[INFO] Starting classifier training...")
-
-for epoch in range(1, EPOCHS + 1):
+for epoch in range(1, args.epochs + 1):
+    frozen = epoch <= args.freeze_epochs
+    for p in encoder.parameters():
+        p.requires_grad = not frozen
+    encoder.train(not frozen)   # frozen encoder in eval mode -> deterministic features
     classifier.train()
-    encoder.train()
-    total_loss = 0
-    
-    for x_patch, y_label in tqdm(train_loader_down, desc=f"Epoch {epoch}/{EPOCHS}", leave=False):
-        x_patch, y_label = x_patch.to(DEVICE), y_label.to(DEVICE)
 
-        feats = encoder(x_patch)
-        logits = classifier(feats)
-        
-        y_win = y_label.max(dim=1).values
-        loss = criterion(logits, y_win)
-
-        optimizer.zero_grad()
+    total_loss = 0.0
+    for x, y in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}{' (frozen enc)' if frozen else ''}", leave=False):
+        x, y = x.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+        loss = criterion(classifier(encoder(x)), y)
+        optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(list(classifier.parameters()) + list(encoder.parameters()), 1.0)
         optimizer.step()
-        
         total_loss += loss.item()
+    avg_train_loss = total_loss / len(train_loader)
 
-    avg_train_loss = total_loss / len(train_loader_down)
-    
-    classifier.eval()
-    encoder.eval()
-    total_val_loss = 0.0
-    
-    with torch.no_grad():
-        for x_val, y_val in val_loader_down:
-            x_val, y_val = x_val.to(DEVICE), y_val.to(DEVICE)
-            feats = encoder(x_val)
-            logits = classifier(feats)
-            y_win = y_val.max(dim=1).values
-            val_batch_loss = criterion(logits, y_win)
-            total_val_loss += val_batch_loss.item()
-            
-    avg_val_loss = total_val_loss / len(val_loader_down)
-    
-    val_thresh, f1, _, val_auc, _ = evaluate(classifier, encoder, val_loader_down, return_metrics=True, device=DEVICE)
-    
-    # Step scheduler based on Validation Loss
-    scheduler.step(avg_val_loss)
-    
-    wandb.log({
-        "downstream/epoch": epoch,
-        "downstream/train_loss": avg_train_loss,
-        "downstream/val_loss": avg_val_loss,
-        "downstream/val_f1": f1,
-        "downstream/val_auc": val_auc
-    })
-    
-    print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | Val F1: {f1:.4f} | Val AUC: {val_auc:.4f}")
+    val = evaluate(classifier, encoder, val_loader, device=DEVICE)
+    scheduler.step(val["f1"])
+    print(f"Epoch {epoch} | train loss {avg_train_loss:.4f} | val F1 {val['f1']:.4f} P {val['precision']:.4f} "
+          f"R {val['recall']:.4f} PR-AUC {val['pr_auc']:.4f} ROC-AUC {val['roc_auc']:.4f} thr {val['threshold']:.3f} "
+          f"| lr enc {optimizer.param_groups[0]['lr']:.1e}")
+    if args.wandb:
+        wandb.log({"downstream/epoch": epoch, "downstream/train_loss": avg_train_loss,
+                   **{f"downstream/val_{k}": v for k, v in val.items()}})
 
-    if avg_val_loss < best_val_loss:
-        best_val_loss = avg_val_loss
-        best_thresh = val_thresh
-        wait = 0
-        
-        torch.save({
-            "classifier_state_dict": classifier.state_dict(),
-            "encoder_state_dict": encoder.state_dict(),
-            "threshold": best_thresh,
-        }, downstream_model_path) 
-        print(f"   --> Saving the best model (Val Loss: {best_val_loss:.4f})")
+    if val["f1"] > best_f1:
+        best_f1, wait = val["f1"], 0
+        torch.save({"classifier_state_dict": classifier.state_dict(), "encoder_state_dict": encoder.state_dict(),
+                    "threshold": val["threshold"], "val_metrics": val,
+                    "config": {"num_patches": NUM_PATCHES, "patch_len": PATCH_LEN, "latent_dim": LATENT_DIM,
+                               "cnn_h_dim": CNN_H_DIM, "nhead": NHEAD, "num_layers": NUM_TRANS_LAYERS,
+                               "in_channels": IN_CHANNELS, "window_size": WINDOW_SIZE,
+                               "forecast_horizon": FORECAST_HORIZON, "from_scratch": args.from_scratch}}, ckpt_path)
+        print(f"   --> best val F1 so far, saved to {ckpt_path}")
     else:
         wait += 1
+        if wait >= args.patience:
+            print(f"[EARLY STOPPING] no val-F1 improvement for {args.patience} epochs")
+            break
 
-    if wait >= patience:
-        print(f"[EARLY STOPPING] No improvement for {patience} epochs.")
-        break
-
-wandb.finish()
-print(f"\n[INFO] Downstream Complete! Best validation threshold: {best_thresh:.4f}")
+if args.wandb:
+    wandb.finish()
+print(f"\n[INFO] Downstream complete. Best val F1 {best_f1:.4f}")

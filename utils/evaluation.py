@@ -1,92 +1,89 @@
-import torch
+"""
+Shared evaluation protocol for SC-JEPA and the baselines.
+
+- the decision threshold is chosen on the VALIDATION set (max F1) and applied unchanged
+  to the test set;
+- PR-AUC (average precision) is reported because with ~1% positives it is far more
+  informative than ROC-AUC;
+- the test F1 at the test-optimal threshold ("oracle") is reported for diagnostics only:
+  the gap to the val-threshold F1 measures how badly the threshold transfers.
+"""
+import json
+import os
+
 import numpy as np
-from sklearn.metrics import f1_score, roc_auc_score, confusion_matrix, classification_report
-from tqdm import tqdm
+import torch
+from sklearn.metrics import (average_precision_score, confusion_matrix,
+                             precision_recall_curve, roc_auc_score)
 
+
+def best_threshold(probs, targets):
+    """Threshold maximising F1, computed exactly from the precision-recall curve."""
+    p, r, t = precision_recall_curve(targets, probs)
+    f1 = 2 * p[:-1] * r[:-1] / np.clip(p[:-1] + r[:-1], 1e-12, None)
+    i = int(np.argmax(f1))
+    return float(t[i]), float(f1[i])
+
+
+def metrics_at(probs, targets, thresh):
+    pred = (probs >= thresh).astype(int)
+    tn, fp, fn, tp = confusion_matrix(targets, pred, labels=[0, 1]).ravel()
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-12)
+    return {"threshold": float(thresh), "precision": float(precision), "recall": float(recall),
+            "f1": float(f1), "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+
+
+def ranking_metrics(probs, targets):
+    return {"roc_auc": float(roc_auc_score(targets, probs)),
+            "pr_auc": float(average_precision_score(targets, probs))}
+
+
+def summarize(val_probs, val_targets, test_probs, test_targets):
+    """Full protocol: threshold on val -> metrics on test (+ oracle threshold for diagnostics)."""
+    thr, val_f1 = best_threshold(val_probs, val_targets)
+    out = {"val": {**metrics_at(val_probs, val_targets, thr), **ranking_metrics(val_probs, val_targets)},
+           "test": {**metrics_at(test_probs, test_targets, thr), **ranking_metrics(test_probs, test_targets)}}
+    oracle_thr, oracle_f1 = best_threshold(test_probs, test_targets)
+    out["test"]["oracle_threshold"] = oracle_thr
+    out["test"]["oracle_f1"] = oracle_f1
+    return out
+
+
+def print_report(name, res):
+    v, t = res["val"], res["test"]
+    print(f"\n--- {name} ---")
+    print(f"threshold (from val): {t['threshold']:.4f}   val F1 {v['f1']:.4f}   val PR-AUC {v['pr_auc']:.4f}")
+    print(f"TEST  precision {t['precision']*100:6.2f}%  recall {t['recall']*100:6.2f}%  F1 {t['f1']*100:6.2f}%"
+          f"  PR-AUC {t['pr_auc']:.4f}  ROC-AUC {t['roc_auc']:.4f}")
+    print(f"TEST  TN {t['tn']} | FP {t['fp']} | FN {t['fn']} | TP {t['tp']}")
+    print(f"TEST  F1 at test-optimal threshold (oracle, diagnostic only): {t['oracle_f1']*100:.2f}% @ {t['oracle_threshold']:.4f}")
+
+
+def save_result(name, res, out_dir="results"):
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{name}.json")
+    with open(path, "w") as f:
+        json.dump({"model": name, **res}, f, indent=2)
+    return path
+
+
+# ----------------------------------------------------------------------------- torch helpers
 @torch.no_grad()
-def evaluate(classifier, encoder, dataloader, return_metrics=False, device='cuda'):
-
+def predict_probs(classifier, encoder, dataloader, device="cuda"):
     classifier.eval()
     encoder.eval()
-    
-    all_preds = []
-    all_targets = []
-    
+    probs, targets = [], []
     for x, y in dataloader:
-        x = x.to(device)
-        
-        feats = encoder(x)
-        logits = classifier(feats)
-        
-        probs = torch.softmax(logits, dim=1)[:, 1]
-        
-        all_preds.extend(probs.cpu().numpy())
-        
-        y_win = y.max(dim=1).values
-        all_targets.extend(y_win.cpu().numpy())
+        logits = classifier(encoder(x.to(device)))
+        probs.append(torch.softmax(logits, dim=1)[:, 1].cpu().numpy())
+        targets.append(y.numpy())
+    return np.concatenate(probs), np.concatenate(targets)
 
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    
-    auc = roc_auc_score(all_targets, all_preds)
-    
-    # Best threshold search
-    best_f1 = 0
-    best_thresh = 0.5
-    min_prob = np.min(all_preds)
-    max_prob = np.max(all_preds)
-    
-    thresholds = np.linspace(max(0.001, min_prob), min(0.999, max_prob), 100)
-    
-    for thresh in thresholds:
-        preds_bin = (all_preds >= thresh).astype(int)
-        f1 = f1_score(all_targets, preds_bin, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = thresh
-            
-    if return_metrics:
-        preds_bin = (all_preds >= best_thresh).astype(int)
-        cm = confusion_matrix(all_targets, preds_bin)
-        return best_thresh, best_f1, cm, auc, (all_preds, all_targets)
-    
-    return best_thresh, best_f1
 
-@torch.no_grad()
-def test_evaluation(classifier, encoder, dataloader, threshold, device='cuda'):
-
-    classifier.eval()
-    encoder.eval()
-    
-    all_preds = []
-    all_targets = []
-    
-    for x, y in tqdm(dataloader, desc="Test Set Evaluation"):
-        x = x.to(device)
-        
-        feats = encoder(x)
-        logits = classifier(feats)
-        probs = torch.softmax(logits, dim=1)[:, 1]
-        
-        all_preds.extend(probs.cpu().numpy())
-        
-        y_win = y.max(dim=1).values
-        all_targets.extend(y_win.cpu().numpy())
-
-    all_preds = np.array(all_preds)
-    all_targets = np.array(all_targets)
-    
-    auc = roc_auc_score(all_targets, all_preds)
-    preds_bin = (all_preds >= threshold).astype(int)
-    
-    print("\n--- Test set results ---")
-    print(f"ROC AUC Score: {auc:.4f}")
-    print(f"Threshold applied: {threshold:.4f}\n")
-    
-    print("Classification Report:")
-    print(classification_report(all_targets, preds_bin, digits=4))
-    
-    cm = confusion_matrix(all_targets, preds_bin)
-    print("\nConfusion Matrix:")
-    print(f"True Negative (TN): {cm[0][0]} | False Positive (FP): {cm[0][1]}")
-    print(f"False Negative (FN): {cm[1][0]} | True Positive (TP): {cm[1][1]}")
+def evaluate(classifier, encoder, dataloader, device="cuda"):
+    """Validation-time evaluation: best threshold + metrics at that threshold + ranking metrics."""
+    probs, targets = predict_probs(classifier, encoder, dataloader, device)
+    thr, _ = best_threshold(probs, targets)
+    return {**metrics_at(probs, targets, thr), **ranking_metrics(probs, targets)}

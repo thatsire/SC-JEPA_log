@@ -1,95 +1,47 @@
+"""
+Test-set evaluation of a downstream checkpoint with the shared protocol
+(threshold from validation, PR-AUC, oracle F1). Writes results/<name>.json.
+"""
+import argparse
 import os
-import torch
-import numpy as np
-from torch.utils.data import DataLoader, Dataset
 
-from data.utils import set_seed
+import torch
+from torch.utils.data import DataLoader
+
 from data.datasets import PredictiveMaintenanceDataset
-from models.encoder import Encoder
+from data.utils import set_seed
 from models.classifier import SimpleClassifier
-from utils.evaluation import test_evaluation
+from models.encoder import Encoder
+from utils.evaluation import predict_probs, print_report, save_result, summarize
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--data_dir", default="dataset")
+ap.add_argument("--ckpt", default="checkpoints/downstream.pth")
+ap.add_argument("--name", default="scjepa", help="name of the results/<name>.json file")
+args = ap.parse_args()
 
 set_seed(42)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"[INFO] Using device: {DEVICE}")
+ckpt = torch.load(args.ckpt, map_location=DEVICE, weights_only=True)
+cfg = ckpt["config"]
 
-WINDOW_SIZE = 24  
-PATCH_LEN = 6
-NUM_PATCHES = (WINDOW_SIZE // 2) // PATCH_LEN
-LATENT_DIM = 64
+train_ds = PredictiveMaintenanceDataset(os.path.join(args.data_dir, "train.csv"), mode="downstream",
+                                        window_size=cfg["window_size"], forecast_horizon=cfg["forecast_horizon"], patch_len=cfg["patch_len"])
+loaders = {}
+for split in ("val", "test"):
+    ds = PredictiveMaintenanceDataset(os.path.join(args.data_dir, f"{split}.csv"), mode="downstream", window_size=cfg["window_size"],
+                                      forecast_horizon=cfg["forecast_horizon"], patch_len=cfg["patch_len"], scaler=train_ds.scaler)
+    loaders[split] = DataLoader(ds, batch_size=1024, shuffle=False, num_workers=4)
 
-CNN_H_DIM = 64          
-NHEAD = 2           
-NUM_TRANS_LAYERS = 2
-
-BATCH_SIZE = 256
-DATA_DIR = "/home/jovyan/workspace/SC-JEPA/data"
-
-class DownstreamWrapper(Dataset):
-    def __init__(self, original_ds, num_patches, patch_len, in_channels):
-        self.ds = original_ds
-        self.num_patches = num_patches
-        self.patch_len = patch_len
-        self.in_channels = in_channels
-        
-        y_matrix = self.ds.df[self.ds.label_cols].values
-        labels = []
-        for seq in self.ds.sequences:
-            y_window = y_matrix[seq['label_start'] : seq['label_end']]
-            y_label = np.zeros(1) if y_window.size == 0 else np.max(y_window, axis=0)
-            y_expanded = torch.tensor(y_label, dtype=torch.float32).repeat(self.num_patches).to(torch.long)
-            labels.append(y_expanded)
-        self.y_label = torch.stack(labels)
-
-    def __len__(self): 
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        x, _ = self.ds[idx]
-        y_expanded = self.y_label[idx]
-        x_recent = x[-(self.num_patches * self.patch_len):, :]
-        return x_recent.view(self.num_patches, self.patch_len, self.in_channels), y_expanded
-
-print("[INFO] Loading test data...")
-train_csv = os.path.join(DATA_DIR, "train.csv")
-test_csv = os.path.join(DATA_DIR, "test.csv")
-
-train_ds_scaler = PredictiveMaintenanceDataset(train_csv, window_size=WINDOW_SIZE, mode='downstream')
-
-x_sample, _ = train_ds_scaler[0]
-IN_CHANNELS = x_sample.shape[1]
-
-test_ds_raw = PredictiveMaintenanceDataset(test_csv, window_size=WINDOW_SIZE, mode='downstream', scaler=train_ds_scaler.scaler)
-
-test_ds_wrapped = DownstreamWrapper(test_ds_raw, NUM_PATCHES, PATCH_LEN, IN_CHANNELS)
-test_loader_down = DataLoader(test_ds_wrapped, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-
-print("[INFO] Initializing empty models...")
-encoder = Encoder(
-    num_patches=NUM_PATCHES, patch_len=PATCH_LEN, latent_dim=LATENT_DIM, 
-    cnn_h_dim=CNN_H_DIM, trans_nhead=NHEAD, trans_num_layers=NUM_TRANS_LAYERS, in_channels=IN_CHANNELS
-).to(DEVICE)
-
-classifier = SimpleClassifier(input_dim=LATENT_DIM, num_patches=NUM_PATCHES).to(DEVICE)
-
-downstream_model_path = '/home/jovyan/workspace/SC-JEPA/checkpoints/downstream.pth'
-print(f"[INFO] Loading weights and optimal threshold from {downstream_model_path}...")
-
-ckpt = torch.load(downstream_model_path, map_location=DEVICE, weights_only=False)
-
+encoder = Encoder(num_patches=cfg["num_patches"], patch_len=cfg["patch_len"], latent_dim=cfg["latent_dim"], cnn_h_dim=cfg["cnn_h_dim"],
+                  trans_nhead=cfg["nhead"], trans_num_layers=cfg["num_layers"], in_channels=cfg["in_channels"]).to(DEVICE)
+classifier = SimpleClassifier(input_dim=cfg["latent_dim"], num_patches=cfg["num_patches"]).to(DEVICE)
 encoder.load_state_dict(ckpt["encoder_state_dict"])
 classifier.load_state_dict(ckpt["classifier_state_dict"])
-val_threshold = ckpt["threshold"]
 
-encoder.eval()
-classifier.eval()
-
-print("\n" + "="*50)
-print("Starting evaluation on test set...")
-print("="*50)
-
-print(f"[INFO] Using the optimal threshold computed during validation: {val_threshold:.4f}\n")
-
-test_evaluation(classifier, encoder, test_loader_down, val_threshold, device=DEVICE)
-
-print("\n[INFO] Evaluation Complete!")
+val_probs, val_y = predict_probs(classifier, encoder, loaders["val"], DEVICE)
+test_probs, test_y = predict_probs(classifier, encoder, loaders["test"], DEVICE)
+res = summarize(val_probs, val_y, test_probs, test_y)
+print(f"[INFO] checkpoint {args.ckpt} (from_scratch={cfg.get('from_scratch', False)}), saved val threshold {ckpt['threshold']:.4f}")
+print_report(args.name, res)
+print("saved:", save_result(args.name, res))
