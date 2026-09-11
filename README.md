@@ -4,8 +4,8 @@
 
 * Dataset: Microsoft Azure Predictive Maintenance (100 machines, hourly telemetry for 2015, 761 failures).
 * The raw files (`PdM_telemetry.csv`, `PdM_machines.csv`, `PdM_failures.csv`) are not in the working
-  tree; they can be recovered from git history:
-  `git show "c728603:csv files/PdM_telemetry.csv" > raw/PdM_telemetry.csv` (same for the other two).
+  tree. `prepare_data.py` recovers them automatically from git history (commit `c728603`) into
+  `raw/` when they are missing; alternatively download the dataset and put the three files in `raw/`.
 * `prepare_data.py` builds `dataset/{train,val,test}.csv` from them with a temporal split per machine
   (Jan–Aug / Sep–Oct / Nov–Dec 2015); columns: `datetime, machineID, volt, rotate, pressure, vibration,
   age, model (0..3), fail_comp1..fail_comp4` (1 at the failure hour).
@@ -14,7 +14,7 @@
 
 ```bash
 # 1. train/val/test CSVs, temporal split per machine: Jan-Aug / Sep-Oct / Nov-Dec 2015
-python prepare_data.py --raw_dir raw --out_dir dataset
+python prepare_data.py                                    # -> dataset/{train,val,test}.csv (raw files fetched if missing)
 
 # 2. SC-JEPA pre-training (24h past -> 24h future, 4 patches of 6h, ~1 min/epoch on an RTX A6000)
 python train_encoder.py --epochs 30                       # -> checkpoints/encoder.pth (online + EMA encoder)

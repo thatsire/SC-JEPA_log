@@ -5,3 +5,4 @@ checkpoints*/
 results/
 logs/
 wandb/
+raw/

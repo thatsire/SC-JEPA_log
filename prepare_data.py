@@ -15,19 +15,45 @@ Output columns: datetime, machineID, volt, rotate, pressure, vibration, age,
 """
 import argparse
 import os
+import subprocess
 
 import pandas as pd
 
 COMPS = ["comp1", "comp2", "comp3", "comp4"]
+RAW_FILES = ["PdM_telemetry.csv", "PdM_machines.csv", "PdM_failures.csv"]
+RAW_GIT_COMMIT = "c728603"          # last commit that still contained the raw CSVs
+RAW_GIT_DIR = "csv files"           # their folder inside that commit
+
+
+def ensure_raw_files(raw_dir):
+    """Recover the raw Azure PdM CSVs from git history if they are not in raw_dir."""
+    missing = [f for f in RAW_FILES if not os.path.isfile(os.path.join(raw_dir, f))]
+    if not missing:
+        return
+    os.makedirs(raw_dir, exist_ok=True)
+    print(f"[INFO] {', '.join(missing)} not found in '{raw_dir}', extracting from git commit {RAW_GIT_COMMIT}...")
+    for f in missing:
+        out = os.path.join(raw_dir, f)
+        try:
+            with open(out, "wb") as fh:
+                subprocess.run(["git", "show", f"{RAW_GIT_COMMIT}:{RAW_GIT_DIR}/{f}"], stdout=fh, check=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if os.path.exists(out):
+                os.remove(out)
+            raise SystemExit(
+                f"Cannot find {f}. Download the Azure Predictive Maintenance dataset and put "
+                f"{', '.join(RAW_FILES)} in '{raw_dir}', or run from a clone that contains commit {RAW_GIT_COMMIT}.")
+        print(f"  -> {out} ({os.path.getsize(out) / 1e6:.1f} MB)")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw_dir", required=True, help="directory with PdM_*.csv")
+    ap.add_argument("--raw_dir", default="raw", help="directory with PdM_*.csv (recovered from git history if missing)")
     ap.add_argument("--out_dir", default="dataset")
     ap.add_argument("--val_start", default="2015-09-01")
     ap.add_argument("--test_start", default="2015-11-01")
     args = ap.parse_args()
+    ensure_raw_files(args.raw_dir)
 
     tel = pd.read_csv(os.path.join(args.raw_dir, "PdM_telemetry.csv"), parse_dates=["datetime"])
     fail = pd.read_csv(os.path.join(args.raw_dir, "PdM_failures.csv"), parse_dates=["datetime"])
